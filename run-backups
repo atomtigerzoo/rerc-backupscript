@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# MySQL backup folder
+MYSQL_FOLDER="/usr/backups/mysql"
+
+# Restic repository
+RESTIC_REPO="/usr/backups/restic"
+
+# Restic password file
+RESTIC_PASSWORD_FILE="/etc/resticpass"
+
+# Folders for restic to backup
+RESTIC_FOLDERS_TO_BACKUP="$MYSQL_FOLDER /etc /root /home /var/lib/dpkg /var/log"
+
+# Keep options for restic
+RESTIC_KEEP_OPTIONS="--keep-last 3 --keep-weekly 2 --keep-monthly 2"
+
+# rclone remote
+RCLONE_REMOTE_NAME="b2"
+RCLONE_REMOTE_PATH="yourBucketName/$HOSTNAME"
+
+
+# # # # # # # # # # # #
+# STOP editing here
+# # # # # # # # # # # #
+
+# Check if MySQL folder exists
+if ! cd $MYSQL_FOLDER; then
+	echo "Creating new folder for MySQL backups..."
+	mkdir -p $MYSQL_FOLDER
+	chown -R root:root $MYSQL_FOLDER
+	chmod 700 $MYSQL_FOLDER
+fi
+
+# MySQL backups
+databases=`mysql --defaults-extra-file=/etc/mysql/debian.cnf -e "SHOW DATABASES;" | tr -d "| " | grep -v Database`
+
+for db in $databases; do
+    if \
+    [[ "$db" != "information_schema" ]] && \
+    [[ "$db" != "performance_schema" ]] && \
+    [[ "$db" != "mysql" ]] && \
+    [[ "$db" != _* ]] ; 
+    then
+        echo "Dumping database: $db"
+
+	mysqldump \
+		--defaults-extra-file=/etc/mysql/debian.cnf \
+		--databases $db > $MYSQL_FOLDER/$HOSTNAME-$db.sql
+
+        gzip -f $MYSQL_FOLDER/$HOSTNAME-$db.sql
+    fi
+done
+
+
+# restic: Check if repo is initialised
+if ! restic -p $RESTIC_PASSWORD_FILE -r $RESTIC_REPO snapshots; then
+	echo "Creating new restic repo..."
+	restic \
+	-p $RESTIC_PASSWORD_FILE \
+	-r $RESTIC_REPO \
+	init
+else
+	echo "Repo already present..."
+fi
+
+
+# restic: run backup
+echo "Running restic backup..."
+restic \
+	-p $RESTIC_PASSWORD_FILE \
+	-r $RESTIC_REPO \
+	backup $RESTIC_FOLDERS_TO_BACKUP
+
+
+# restic: cleanup repo
+echo "Running restic forget with prune..."
+restic \
+	-p $RESTIC_PASSWORD_FILE \
+	-r $RESTIC_REPO \
+	forget $RESTIC_KEEP_OPTIONS \
+	--prune
+
+
+# rclone: sync to remote destination
+echo "Running rclone sync..."
+rclone sync \
+	--fast-list \
+	--transfers 25 \
+	--b2-hard-delete \
+	$RESTIC_REPO \
+	$RCLONE_REMOTE_NAME:$RCLONE_REMOTE_PATH
+
+
+# rclone: cleanup remote
+echo "Running rclone cleanup..."
+rclone cleanup \
+	--fast-list \
+	$RCLONE_REMOTE_NAME:$RCLONE_REMOTE_PATH
+
+# @TODO check for errors
+if ! [ $? -eq 0 ]; then
+	# send email
+else
+	# check if user wants success email, if so, send it
+fi
+
+exit 0
